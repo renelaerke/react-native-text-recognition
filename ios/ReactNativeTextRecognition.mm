@@ -14,7 +14,16 @@
 using namespace facebook::react;
 
 @interface ReactNativeTextRecognition ()
-@property (nonatomic, strong) RCTResponseSenderBlock callback;
+// Concurrency safety: previously a single shared `self.callback`
+// property aliased the most recent caller's `RCTResponseSenderBlock`,
+// so two concurrent recognise() calls from JS would overwrite each
+// other's callback and on completion the same JSI callback ended up
+// invoked twice. RN's TurboModule layer aborts on the second
+// invocation (`google::LogMessageFatal` → `SIGABRT` from
+// `convertJSIFunctionToCallback`). Threading the callback through
+// every method as a per-call parameter keeps each request's callback
+// scoped to its own dispatch chain.
+//
 // Forward declarations to satisfy compiler for private methods
 - (void)processPDFFile:(NSURL *)url
                options:(NSDictionary *)options
@@ -23,12 +32,14 @@ using namespace facebook::react;
              languages:(NSArray *)languages
       recognitionLevel:(NSString *)recognitionLevel
     useFastRecognition:(BOOL)useFastRecognition
-      preprocessImages:(BOOL)preprocessImages;
+      preprocessImages:(BOOL)preprocessImages
+              callback:(RCTResponseSenderBlock)callback;
 
 - (void)processImageFile:(NSURL *)url
                languages:(NSArray *)languages
         recognitionLevel:(NSString *)recognitionLevel
-      useFastRecognition:(BOOL)useFastRecognition;
+      useFastRecognition:(BOOL)useFastRecognition
+                callback:(RCTResponseSenderBlock)callback;
 
 - (NSDictionary *)recognizeTextInImage:(UIImage *)image
                             pageNumber:(NSInteger)pageNumber
@@ -114,8 +125,6 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
                        options:(NSDictionary *)options
                       callback:(RCTResponseSenderBlock)callback
 {
-    self.callback = callback;
-    
     // Parse options
     NSArray *languages = options[@"languages"];
     BOOL useFastRecognition = [options[@"useFastRecognition"] boolValue];
@@ -146,10 +155,10 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
         @try {
             NSURL *url = [NSURL URLWithString:fileUrl];
             if (!url) {
-                [self sendError:@"Invalid file URL"];
+                [self sendError:@"Invalid file URL" callback:callback];
                 return;
             }
-            
+
             // Check if it's a PDF
             NSString *extension = [[url pathExtension] lowercaseString];
             if ([extension isEqualToString:@"pdf"]) {
@@ -160,15 +169,18 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
                            languages:languages
                     recognitionLevel:recognitionLevel
                   useFastRecognition:useFastRecognition
-                   preprocessImages:preprocessImages];
+                   preprocessImages:preprocessImages
+                            callback:callback];
             } else {
                 [self processImageFile:url
                              languages:languages
                       recognitionLevel:recognitionLevel
-                    useFastRecognition:useFastRecognition];
+                    useFastRecognition:useFastRecognition
+                              callback:callback];
             }
         } @catch (NSException *exception) {
-            [self sendError:[NSString stringWithFormat:@"Exception: %@", exception.reason]];
+            [self sendError:[NSString stringWithFormat:@"Exception: %@", exception.reason]
+                   callback:callback];
         }
     });
 }
@@ -177,21 +189,23 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
                languages:(NSArray *)languages
         recognitionLevel:(NSString *)recognitionLevel
       useFastRecognition:(BOOL)useFastRecognition
+                callback:(RCTResponseSenderBlock)callback
 {
     VNImageRequestHandler *requestHandler = [[VNImageRequestHandler alloc] initWithURL:url options:@{}];
-    
+
     VNRecognizeTextRequest *request = [self createTextRecognitionRequest:languages
                                                          recognitionLevel:recognitionLevel
                                                        useFastRecognition:useFastRecognition];
-    
+
     NSError *error = nil;
     [requestHandler performRequests:@[request] error:&error];
-    
+
     if (error) {
-        [self sendError:[NSString stringWithFormat:@"Request error: %@", error.localizedDescription]];
+        [self sendError:[NSString stringWithFormat:@"Request error: %@", error.localizedDescription]
+               callback:callback];
         return;
     }
-    
+
     // Get image dimensions for bounding boxes
     NSArray *results = request.results;
     if (results == nil || results.count == 0) {
@@ -203,25 +217,25 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
                 @"totalPages": @0,
                 @"fullText": @""
             };
-            self.callback(@[response]);
+            callback(@[response]);
         });
         return;
     }
-    
+
     // Get image size
     CIImage *ciImage = [[CIImage alloc] initWithContentsOfURL:url];
     CGSize imageSize = ciImage ? ciImage.extent.size : CGSizeMake(1024, 1024);
-    
+
     NSDictionary *pageResult = [self formatRecognitionResults:results
                                                     pageNumber:0
                                                 imageDimensions:imageSize
                                               recognitionLevel:recognitionLevel];
-    
+
     NSMutableString *fullText = [NSMutableString string];
     if (pageResult[@"fullText"]) {
         [fullText appendString:pageResult[@"fullText"]];
     }
-    
+
     dispatch_async(dispatch_get_main_queue(), ^{
         NSDictionary *response = @{
             @"success": @YES,
@@ -229,7 +243,7 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
             @"totalPages": @1,
             @"fullText": fullText
         };
-        self.callback(@[response]);
+        callback(@[response]);
     });
 }
 
@@ -241,11 +255,12 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
       recognitionLevel:(NSString *)recognitionLevel
     useFastRecognition:(BOOL)useFastRecognition
       preprocessImages:(BOOL)preprocessImages
+              callback:(RCTResponseSenderBlock)callback
 API_AVAILABLE(ios(11.0))
 {
     PDFDocument *pdfDocument = [[PDFDocument alloc] initWithURL:url];
     if (!pdfDocument) {
-        [self sendError:@"Failed to load PDF document"];
+        [self sendError:@"Failed to load PDF document" callback:callback];
         return;
     }
 
@@ -353,7 +368,7 @@ API_AVAILABLE(ios(11.0))
     };
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.callback(@[result]);
+        callback(@[result]);
     });
 }
 
@@ -567,18 +582,17 @@ API_AVAILABLE(ios(11.0))
 
 - (void)recognizeTextLegacy:(NSString *)imgUrl callback:(RCTResponseSenderBlock)callback
 {
-    self.callback = callback;
     RCTLogInfo(@"Legacy text recognition for: %@", imgUrl);
-    
+
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSURL *url = [NSURL URLWithString:imgUrl];
         VNImageRequestHandler *requestHandler = [[VNImageRequestHandler alloc] initWithURL:url options:@{}];
-        
+
         VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest * _Nonnull request, NSError * _Nullable error) {
             if (error) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     RCTLogError(@"VNRecognizeTextRequest error: %@", error);
-                    self.callback(@[@{@"error": @YES, @"errorMessage": error.localizedDescription}]);
+                    callback(@[@{@"error": @YES, @"errorMessage": error.localizedDescription}]);
                 });
             } else {
                 if (request.results.count > 0) {
@@ -590,29 +604,29 @@ API_AVAILABLE(ios(11.0))
                             @"confidence": @(topCandidate.confidence).stringValue
                         }];
                     }
-                    
+
                     dispatch_async(dispatch_get_main_queue(), ^{
                         RCTLogInfo(@"Detected words: %lu", (unsigned long)words.count);
-                        self.callback(@[@{@"detectedWords": words}]);
+                        callback(@[@{@"detectedWords": words}]);
                     });
                 } else {
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        self.callback(@[@{@"detectedWords": @[]}]);
+                        callback(@[@{@"detectedWords": @[]}]);
                     });
                 }
             }
         }];
-        
+
         // On iOS 16+ the system uses latest revision automatically
         request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
         request.usesLanguageCorrection = YES;
-        
+
         NSError *error = nil;
         [requestHandler performRequests:@[request] error:&error];
         if (error) {
             RCTLogError(@"Request handler error: %@", error);
             dispatch_async(dispatch_get_main_queue(), ^{
-                self.callback(@[@{@"error": @YES, @"errorMessage": error.localizedDescription}]);
+                callback(@[@{@"error": @YES, @"errorMessage": error.localizedDescription}]);
             });
         }
     });
@@ -620,11 +634,11 @@ API_AVAILABLE(ios(11.0))
 
 #pragma mark - Helpers
 
-- (void)sendError:(NSString *)errorMessage
+- (void)sendError:(NSString *)errorMessage callback:(RCTResponseSenderBlock)callback
 {
     RCTLogError(@"%@", errorMessage);
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.callback(@[@{
+        callback(@[@{
             @"success": @NO,
             @"error": @YES,
             @"errorMessage": errorMessage
