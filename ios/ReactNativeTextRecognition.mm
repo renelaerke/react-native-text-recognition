@@ -14,7 +14,13 @@
 using namespace facebook::react;
 
 @interface ReactNativeTextRecognition ()
-@property (nonatomic, strong) RCTResponseSenderBlock callback;
+// NOTE: the response callback is deliberately NOT a property. RN native
+// modules are singletons, so an instance-level callback is shared by every
+// in-flight call: concurrent invocations overwrite each other, one JS promise
+// never settles and the other's callback fires twice — which React Native
+// answers with "Callback arg cannot be called more than once" and a SIGABRT.
+// The callback travels down the call chain as a parameter instead (the
+// Android module always did it this way).
 // Forward declarations to satisfy compiler for private methods
 - (void)processPDFFile:(NSURL *)url
                options:(NSDictionary *)options
@@ -23,12 +29,14 @@ using namespace facebook::react;
              languages:(NSArray *)languages
       recognitionLevel:(NSString *)recognitionLevel
     useFastRecognition:(BOOL)useFastRecognition
-      preprocessImages:(BOOL)preprocessImages;
+      preprocessImages:(BOOL)preprocessImages
+              callback:(RCTResponseSenderBlock)callback;
 
 - (void)processImageFile:(NSURL *)url
                languages:(NSArray *)languages
         recognitionLevel:(NSString *)recognitionLevel
-      useFastRecognition:(BOOL)useFastRecognition;
+      useFastRecognition:(BOOL)useFastRecognition
+                callback:(RCTResponseSenderBlock)callback;
 
 - (NSDictionary *)recognizeTextInImage:(UIImage *)image
                             pageNumber:(NSInteger)pageNumber
@@ -60,6 +68,25 @@ RCT_EXPORT_MODULE()
     return std::make_shared<facebook::react::NativeTextRecognitionSpecJSI>(params);
 }
 #endif
+
+/**
+ * Wrap a React callback so it can fire at most once. Vision/PDFKit error and
+ * success paths are not perfectly disjoint (performRequests can both run the
+ * completion handler and return an error), and RN aborts the process on a
+ * second invocation — better to drop a duplicate than to crash.
+ */
+static RCTResponseSenderBlock RNTROnceCallback(RCTResponseSenderBlock callback) {
+    __block RCTResponseSenderBlock inner = [callback copy];
+    NSObject *lock = [NSObject new];
+    return ^(NSArray *args) {
+        RCTResponseSenderBlock c = nil;
+        @synchronized (lock) {
+            c = inner;
+            inner = nil;
+        }
+        if (c) c(args);
+    };
+}
 
 #pragma mark - Public Methods
 
@@ -112,9 +139,9 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
 
 - (void)performTextRecognition:(NSString *)fileUrl
                        options:(NSDictionary *)options
-                      callback:(RCTResponseSenderBlock)callback
+                      callback:(RCTResponseSenderBlock)rawCallback
 {
-    self.callback = callback;
+    RCTResponseSenderBlock callback = RNTROnceCallback(rawCallback);
     
     // Parse options
     NSArray *languages = options[@"languages"];
@@ -146,7 +173,7 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
         @try {
             NSURL *url = [NSURL URLWithString:fileUrl];
             if (!url) {
-                [self sendError:@"Invalid file URL"];
+                [self sendError:@"Invalid file URL" callback:callback];
                 return;
             }
             
@@ -160,15 +187,17 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
                            languages:languages
                     recognitionLevel:recognitionLevel
                   useFastRecognition:useFastRecognition
-                   preprocessImages:preprocessImages];
+                   preprocessImages:preprocessImages
+                            callback:callback];
             } else {
                 [self processImageFile:url
                              languages:languages
                       recognitionLevel:recognitionLevel
-                    useFastRecognition:useFastRecognition];
+                    useFastRecognition:useFastRecognition
+                              callback:callback];
             }
         } @catch (NSException *exception) {
-            [self sendError:[NSString stringWithFormat:@"Exception: %@", exception.reason]];
+            [self sendError:[NSString stringWithFormat:@"Exception: %@", exception.reason] callback:callback];
         }
     });
 }
@@ -177,6 +206,7 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
                languages:(NSArray *)languages
         recognitionLevel:(NSString *)recognitionLevel
       useFastRecognition:(BOOL)useFastRecognition
+                callback:(RCTResponseSenderBlock)callback
 {
     VNImageRequestHandler *requestHandler = [[VNImageRequestHandler alloc] initWithURL:url options:@{}];
     
@@ -188,7 +218,7 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
     [requestHandler performRequests:@[request] error:&error];
     
     if (error) {
-        [self sendError:[NSString stringWithFormat:@"Request error: %@", error.localizedDescription]];
+        [self sendError:[NSString stringWithFormat:@"Request error: %@", error.localizedDescription] callback:callback];
         return;
     }
     
@@ -203,7 +233,7 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
                 @"totalPages": @0,
                 @"fullText": @""
             };
-            self.callback(@[response]);
+            callback(@[response]);
         });
         return;
     }
@@ -229,7 +259,7 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
             @"totalPages": @1,
             @"fullText": fullText
         };
-        self.callback(@[response]);
+        callback(@[response]);
     });
 }
 
@@ -241,11 +271,12 @@ RCT_EXPORT_METHOD(getSupportedLanguages:(RCTPromiseResolveBlock)resolve
       recognitionLevel:(NSString *)recognitionLevel
     useFastRecognition:(BOOL)useFastRecognition
       preprocessImages:(BOOL)preprocessImages
+              callback:(RCTResponseSenderBlock)callback
 API_AVAILABLE(ios(11.0))
 {
     PDFDocument *pdfDocument = [[PDFDocument alloc] initWithURL:url];
     if (!pdfDocument) {
-        [self sendError:@"Failed to load PDF document"];
+        [self sendError:@"Failed to load PDF document" callback:callback];
         return;
     }
 
@@ -353,7 +384,7 @@ API_AVAILABLE(ios(11.0))
     };
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.callback(@[result]);
+        callback(@[result]);
     });
 }
 
@@ -565,9 +596,9 @@ API_AVAILABLE(ios(11.0))
 
 #pragma mark - Legacy Method
 
-- (void)recognizeTextLegacy:(NSString *)imgUrl callback:(RCTResponseSenderBlock)callback
+- (void)recognizeTextLegacy:(NSString *)imgUrl callback:(RCTResponseSenderBlock)rawCallback
 {
-    self.callback = callback;
+    RCTResponseSenderBlock callback = RNTROnceCallback(rawCallback);
     RCTLogInfo(@"Legacy text recognition for: %@", imgUrl);
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -578,7 +609,7 @@ API_AVAILABLE(ios(11.0))
             if (error) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     RCTLogError(@"VNRecognizeTextRequest error: %@", error);
-                    self.callback(@[@{@"error": @YES, @"errorMessage": error.localizedDescription}]);
+                    callback(@[@{@"error": @YES, @"errorMessage": error.localizedDescription}]);
                 });
             } else {
                 if (request.results.count > 0) {
@@ -593,11 +624,11 @@ API_AVAILABLE(ios(11.0))
                     
                     dispatch_async(dispatch_get_main_queue(), ^{
                         RCTLogInfo(@"Detected words: %lu", (unsigned long)words.count);
-                        self.callback(@[@{@"detectedWords": words}]);
+                        callback(@[@{@"detectedWords": words}]);
                     });
                 } else {
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        self.callback(@[@{@"detectedWords": @[]}]);
+                        callback(@[@{@"detectedWords": @[]}]);
                     });
                 }
             }
@@ -612,7 +643,7 @@ API_AVAILABLE(ios(11.0))
         if (error) {
             RCTLogError(@"Request handler error: %@", error);
             dispatch_async(dispatch_get_main_queue(), ^{
-                self.callback(@[@{@"error": @YES, @"errorMessage": error.localizedDescription}]);
+                callback(@[@{@"error": @YES, @"errorMessage": error.localizedDescription}]);
             });
         }
     });
@@ -620,11 +651,11 @@ API_AVAILABLE(ios(11.0))
 
 #pragma mark - Helpers
 
-- (void)sendError:(NSString *)errorMessage
+- (void)sendError:(NSString *)errorMessage callback:(RCTResponseSenderBlock)callback
 {
     RCTLogError(@"%@", errorMessage);
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.callback(@[@{
+        callback(@[@{
             @"success": @NO,
             @"error": @YES,
             @"errorMessage": errorMessage

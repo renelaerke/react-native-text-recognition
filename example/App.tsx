@@ -113,6 +113,27 @@ function App() {
   // Removed PDF viewer. We use picker only.
   const viewPdf = async () => {};
 
+  /**
+   * Regression test for the shared-callback crash (fixed in 2.0.21): firing
+   * several recognitions at once used to overwrite the module-level callback,
+   * hang one promise forever and invoke another's callback twice — which RN
+   * answers with "Callback arg cannot be called more than once" (SIGABRT).
+   * All five calls must settle, each with its own result.
+   */
+  const stressTestConcurrency = async (uri: string) => {
+    console.log('Concurrency stress test: 5 parallel recognizeText calls');
+    const results = await Promise.allSettled(
+      Array.from({length: 5}, () => recognizeText(uri)),
+    );
+    const fulfilled = results.filter(r => r.status === 'fulfilled').length;
+    console.log('Concurrency stress test settled:', fulfilled, '/ 5');
+    Alert.alert(
+      fulfilled === 5 ? 'Concurrency OK' : 'Concurrency FAILED',
+      fulfilled + ' of 5 parallel calls settled' +
+        (fulfilled === 5 ? '' : ' — a promise hung or the app should have crashed'),
+    );
+  };
+
   const processImage = async (uri: string, asset?: Asset) => {
     setLoading(true);
     setImage(null);
@@ -194,6 +215,8 @@ function App() {
         console.log('OCR Result:', JSON.stringify(ocrResult, null, 2));
 
         if (ocrResult.success) {
+          // Long-press the Gallery button to run stressTestConcurrency on the
+          // same asset (see below) when validating the 2.0.21 callback fix.
           setResult(ocrResult);
           Alert.alert('Success', `Found ${ocrResult.pages?.[0]?.elements?.length || 0} text elements`);
         } else {
@@ -326,6 +349,7 @@ function App() {
           <TouchableOpacity
             style={[styles.button, styles.primaryButton]}
             onPress={selectFromGallery}
+            onLongPress={() => image && stressTestConcurrency(image.uri)}
             disabled={loading}>
             <Text style={styles.buttonText}>📷 Select from Gallery</Text>
           </TouchableOpacity>
