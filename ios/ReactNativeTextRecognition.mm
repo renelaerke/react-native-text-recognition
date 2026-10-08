@@ -611,17 +611,18 @@ API_AVAILABLE(ios(11.0))
                 VNRectangleObservation *rectObs = [topCandidate boundingBoxForRange:tokenRange
                                                                               error:&bbError];
                 if (rectObs && !bbError) {
-                    // VNRectangleObservation gives four corners in Vision
-                    // (bottom-left origin). Reduce to an axis-aligned rect
-                    // in top-left origin space — the same transform used by
-                    // the OcrParser C# port.
-                    CGFloat minX = MIN(rectObs.topLeft.x, rectObs.bottomLeft.x);
-                    CGFloat maxY = MAX(rectObs.topLeft.y, rectObs.bottomLeft.y);
+                    // Use the axis-aligned box enclosing all four corners,
+                    // flipped to top-left origin. The corners are named
+                    // relative to the TEXT, not the image, so picking an
+                    // edge from topLeft/bottomLeft is only right for upright
+                    // text — on a 90°-rotated receipt it shifts every word
+                    // box by its own length along the line.
+                    CGRect bb = rectObs.boundingBox;
                     normalizedBox = CGRectMake(
-                        minX,
-                        1.0 - maxY,
-                        rectObs.boundingBox.size.width,
-                        rectObs.boundingBox.size.height
+                        bb.origin.x,
+                        1.0 - bb.origin.y - bb.size.height,
+                        bb.size.width,
+                        bb.size.height
                     );
                     haveBox = YES;
                 }
