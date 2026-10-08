@@ -236,7 +236,7 @@ static CGImagePropertyOrientation CGImageOrientationFromUIImageOrientation(UIIma
     // overlay highlights drift on rotated photos.
     UIImage *image = [UIImage imageWithContentsOfFile:url.path];
     if (!image || !image.CGImage) {
-        [self sendError:@"Failed to load image"];
+        [self sendError:@"Failed to load image" callback:callback];
         return;
     }
     CGImagePropertyOrientation orientation =
